@@ -1,3 +1,22 @@
+# BetterManual HDR
+
+Fork of [obs1dium/BetterManual](https://github.com/obs1dium/BetterManual) focused on HDR exposure bracketing, tested on the **A5000** (ILCE-5000, firmware 1.10). It installs as a separate app (`com.obsidium.bettermanual.hdr`), so it can coexist with the original.
+
+Changes:
+
+* **Armed bracketing**: configure step (EV), picture count and delay once; from then on every shutter press runs the whole series. Settings survive app restarts. The bracket icon turns yellow while armed; select it and press enter to disarm.
+* **Aperture priority bracketing**: the camera meters on each shutter press, no need to set a manual exposure first.
+* **Native bracket**: 3-picture series with 0.3/0.7/1/2/3 EV steps use the camera's own continuous bracket drive mode (much faster). Other series fall back to shifting the shutter speed from the app.
+* **Countdown** configurable from 2 to 10 seconds.
+* **Left/right keys** select the previous/next parameter on cameras without touch screen.
+* Fixed even EV steps (e.g. 2.0EV) producing 0/+2/+6 instead of 0/-2/+2.
+
+ISO must be set to manual for bracketing. Outside bulb mode the camera caps exposures at 30s, which limits the brightest picture in dark scenes.
+
+The original README follows.
+
+---
+
 # Note: This app  is not actively maintained anymore.
 
 # BetterManual

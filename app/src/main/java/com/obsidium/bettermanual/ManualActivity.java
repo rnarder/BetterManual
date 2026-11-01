@@ -6,6 +6,7 @@ import android.graphics.Color;
 import android.hardware.Camera;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.SystemClock;
 import android.util.Pair;
 import android.view.KeyEvent;
 import android.view.SurfaceHolder;
@@ -22,12 +23,15 @@ import com.sony.scalar.sysutil.ScalarInput;
 import com.sony.scalar.sysutil.didep.Settings;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 public class ManualActivity extends BaseActivity implements SurfaceHolder.Callback, View.OnClickListener, CameraEx.ShutterListener, CameraEx.ShutterSpeedChangeListener
 {
     private static final boolean LOGGING_ENABLED = false;
+    private static final boolean BRACKET_TIMING_ENABLED = false;   // diagnostic: show bracket timings on screen
     private static final int MESSAGE_TIMEOUT = 1000;
+    private static final int BRACKET_HINT_TIMEOUT = 3000;
 
     private SurfaceHolder   m_surfaceHolder;
     private CameraEx        m_camera;
@@ -60,10 +64,54 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
     private int             m_bracketStep;  // in 1/3 stops
     private int             m_bracketMaxPicCount;
     private int             m_bracketPicCount;
-    private int             m_bracketShutterDelta;
+    private int             m_bracketPicsTaken;
     private boolean         m_bracketActive;
     private Pair<Integer, Integer> m_bracketNextShutterSpeed;
     private int             m_bracketNeutralShutterIndex;
+    private boolean         m_bracketFromAperture;  // metered in A mode, shot in M mode
+    private boolean         m_bracketArmed;         // shutter key starts a bracket with the saved settings
+    private int             m_bracketDelay;         // countdown before the first picture, in seconds
+    private final Runnable  m_hideBracketHintRunnable = new Runnable()
+    {
+        @Override
+        public void run()
+        {
+            // Only hide the armed hint, the bracket icon stays highlighted instead
+            if (m_bracketArmed && !m_bracketActive && m_dialMode != DialMode.bracketSetStep &&
+                    m_dialMode != DialMode.bracketSetPicCount && m_dialMode != DialMode.bracketSetDelay)
+                m_tvHint.setVisibility(View.GONE);
+        }
+    };
+    private long            m_bracketTimingStart;   // elapsedRealtime() values for BRACKET_TIMING_ENABLED
+    private long            m_bracketTimingFire;
+    private long            m_bracketTimingShutterDone;
+    private boolean         m_bracketNative;        // the camera firmware shoots the series in its own bracket drive mode
+    private String          m_bracketSavedDriveMode;
+    private long            m_bracketNativeExposureMs;  // metered exposure time of the neutral picture
+    private int             m_bracketNativePeriod;      // in 1/10 EV
+    private final Runnable  m_bracketNativeReleaseRunnable = new Runnable()
+    {
+        @Override
+        public void run()
+        {
+            // The A5000 doesn't report the remaining pictures, assume the series is done by now
+            if (BRACKET_TIMING_ENABLED)
+                m_tvLog.append(String.format("  released +%dms\n", SystemClock.elapsedRealtime() - m_bracketTimingStart));
+            finishNativeBracket();
+        }
+    };
+    private String          m_bracketSavedBurstSpeed;
+    private final Runnable  m_bracketNativeTimeoutRunnable = new Runnable()
+    {
+        @Override
+        public void run()
+        {
+            // The camera stopped reporting pictures, release the shutter anyway
+            if (BRACKET_TIMING_ENABLED)
+                m_tvLog.append(m_bracketPicCount == 0 ? "No capture end\n" : "Timeout\n");
+            finishNativeBracket();
+        }
+    };
 
     // Timelapse
     private int             m_autoPowerOffTimeBackup;
@@ -73,6 +121,11 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
     private int             m_timelapsePicsTaken;
     private int             m_countdown;
     private static final int COUNTDOWN_SECONDS = 5;
+    private static final int BRACKET_MIN_DELAY_SECONDS = 2;
+    private static final int BRACKET_MAX_DELAY_SECONDS = 10;
+    private static final long NATIVE_BRACKET_END_TIMEOUT = 1500;   // ms after the last exposure
+    private static final long NATIVE_BRACKET_HOLD_BASE = 1200;     // ms the shutter stays pressed after the first picture starts, plus exposure times
+    private static final long MAX_EXPOSURE_MS = 30000;             // longest exposure the camera does outside bulb mode
     private final Runnable  m_timelapseRunnable = new Runnable()
     {
         @Override
@@ -88,7 +141,7 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         {
             if (--m_countdown > 0)
             {
-                m_tvMsg.setText(String.format("Starting in %d...", m_countdown));
+                m_tvMsg.setText(String.format(m_bracketActive ? "%d" : "Starting in %d...", m_countdown));
                 m_handler.postDelayed(this, 1000);
             }
             else
@@ -140,7 +193,7 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
     enum DialMode { shutter, aperture, iso, exposure, mode, drive,
         timelapse, bracket,
         timelapseSetInterval, timelapseSetPicCount,
-        bracketSetStep, bracketSetPicCount
+        bracketSetStep, bracketSetPicCount, bracketSetDelay
     }
     private DialMode        m_dialMode;
 
@@ -905,6 +958,67 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         // Shutter
         m_camera.setShutterSpeedChangeListener(this);
         m_camera.setShutterListener(this);
+        // Not available on all camera models
+        try
+        {
+            m_camera.setExposureCompleteListener(new CameraEx.ExposureCompleteListener()
+            {
+                @Override
+                public void onDone(int result, CameraEx.ExposureInfo exposureInfo, CameraEx cameraEx)
+                {
+                    if (m_bracketActive && m_bracketNative)
+                        onNativeBracketExposureDone(result, exposureInfo);
+                }
+            });
+        }
+        catch (LinkageError e)
+        {
+        }
+        // Not available on all camera models
+        try
+        {
+            m_camera.setStoreImageCompleteListener(new CameraEx.StoreImageCompleteListener()
+            {
+                @Override
+                public void onDone(int result, CameraEx.StoreImageInfo storeImageInfo, CameraEx cameraEx)
+                {
+                    if (BRACKET_TIMING_ENABLED && m_bracketActive && m_bracketNative)
+                        m_tvLog.append(String.format("  stored %s +%dms\n", storeImageInfo.FileName,
+                                SystemClock.elapsedRealtime() - m_bracketTimingStart));
+                }
+            });
+        }
+        catch (LinkageError e)
+        {
+        }
+        // Not available on all camera models
+        try
+        {
+            m_camera.setCaptureStatusListener(new CameraEx.OnCaptureStatusListener()
+            {
+                @Override
+                public void onStart(int status, CameraEx cameraEx)
+                {
+                    if (BRACKET_TIMING_ENABLED && m_bracketActive && m_bracketNative)
+                        m_tvLog.append(String.format("  capture start +%dms\n", SystemClock.elapsedRealtime() - m_bracketTimingStart));
+                }
+
+                @Override
+                public void onEnd(int reason, int status, CameraEx cameraEx)
+                {
+                    if (m_bracketActive && m_bracketNative)
+                    {
+                        if (BRACKET_TIMING_ENABLED)
+                            m_tvLog.append(String.format("  capture end (reason %d) +%dms\n", reason,
+                                    SystemClock.elapsedRealtime() - m_bracketTimingStart));
+                        finishNativeBracket();
+                    }
+                }
+            });
+        }
+        catch (LinkageError e)
+        {
+        }
 
         /*
         m_camera.setCaptureStatusListener(new CameraEx.OnCaptureStatusListener()
@@ -1080,6 +1194,7 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         updateDriveModeImage();
         updateSceneModeImage();
         updateViewVisibility();
+        restoreBracketArmed();
 
         /* - triggers NPE
         List<Integer> pf = params.getSupportedPreviewFormats();
@@ -1136,7 +1251,7 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
     public void onShutterSpeedChange(CameraEx.ShutterSpeedInfo shutterSpeedInfo, CameraEx cameraEx)
     {
         updateShutterSpeed(shutterSpeedInfo.currentShutterSpeed_n, shutterSpeedInfo.currentShutterSpeed_d);
-        if (m_bracketActive)
+        if (m_bracketActive && m_bracketNextShutterSpeed != null)
         {
             log(String.format("Want shutter speed %d/%d, got %d/%d\n",
                     m_bracketNextShutterSpeed.first, m_bracketNextShutterSpeed.second,
@@ -1147,7 +1262,8 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
                 shutterSpeedInfo.currentShutterSpeed_d == m_bracketNextShutterSpeed.second)
             {
                 // Focus speed adjusted, take next picture
-                m_camera.burstableTakePicture();
+                m_bracketNextShutterSpeed = null;
+                bracketTakePicture();
             }
         }
     }
@@ -1162,7 +1278,8 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             //log(String.format("onShutter ERROR %d\n", i));
             m_takingPicture = false;
         }
-        m_camera.cancelTakePicture();
+        if (!(m_bracketActive && m_bracketNative))
+            m_camera.cancelTakePicture();
 
         if (m_timelapseActive)
             onShutterTimelapse(i);
@@ -1172,36 +1289,90 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
 
     private void onShutterBracket(int i)
     {
+        if (m_bracketNative)
+        {
+            onShutterNativeBracket(i);
+            return;
+        }
+        if (BRACKET_TIMING_ENABLED)
+        {
+            m_bracketTimingShutterDone = SystemClock.elapsedRealtime();
+            m_tvLog.append(String.format(", capture %dms\n", m_bracketTimingShutterDone - m_bracketTimingFire));
+        }
         if (i == 0)
         {
             if (--m_bracketPicCount == 0)
+            {
+                if (BRACKET_TIMING_ENABLED)
+                    m_tvLog.append(String.format("Total %dms\n", m_bracketTimingShutterDone - m_bracketTimingStart));
                 abortBracketing();
+            }
             else
             {
-                m_bracketShutterDelta += m_bracketStep;
+                // Shots after the neutral one alternate darker / brighter: -1, +1, -2, +2... steps
+                ++m_bracketPicsTaken;
+                final int offset = ((m_bracketPicsTaken + 1) / 2) * m_bracketStep;
+                final int targetIndex = m_bracketNeutralShutterIndex + (m_bracketPicsTaken % 2 == 1 ? -offset : offset);
                 final int shutterIndex = CameraUtil.getShutterValueIndex(getCurrentShutterSpeed());
-                if (m_bracketShutterDelta % 2 == 0)
-                {
-                    log(String.format("Adjusting shutter speed by %d\n", -m_bracketShutterDelta));
-                    // Even, reduce shutter speed
-                    m_bracketNextShutterSpeed = new Pair<Integer, Integer>(CameraUtil.SHUTTER_SPEEDS[shutterIndex + m_bracketShutterDelta][0],
-                        CameraUtil.SHUTTER_SPEEDS[shutterIndex + m_bracketShutterDelta][1]);
-                    m_camera.adjustShutterSpeed(-m_bracketShutterDelta);
-                }
-                else
-                {
-                    log(String.format("Adjusting shutter speed by %d\n", m_bracketShutterDelta));
-                    // Odd, increase shutter speed
-                    m_bracketNextShutterSpeed = new Pair<Integer, Integer>(CameraUtil.SHUTTER_SPEEDS[shutterIndex - m_bracketShutterDelta][0],
-                            CameraUtil.SHUTTER_SPEEDS[shutterIndex - m_bracketShutterDelta][1]);
-                    m_camera.adjustShutterSpeed(m_bracketShutterDelta);
-                }
+                log(String.format("Adjusting shutter speed by %d\n", shutterIndex - targetIndex));
+                m_bracketNextShutterSpeed = new Pair<Integer, Integer>(CameraUtil.SHUTTER_SPEEDS[targetIndex][0],
+                        CameraUtil.SHUTTER_SPEEDS[targetIndex][1]);
+                m_camera.adjustShutterSpeed(shutterIndex - targetIndex);
             }
         }
         else
         {
             abortBracketing();
         }
+    }
+
+    // The camera reports the shutter only once for the whole native series, exposures are counted in onNativeBracketExposureDone
+    private void onShutterNativeBracket(int i)
+    {
+        if (BRACKET_TIMING_ENABLED)
+            m_tvLog.append(String.format("  shutter (result %d) +%dms\n", i, SystemClock.elapsedRealtime() - m_bracketTimingStart));
+        if (i != 0)
+            finishNativeBracket();
+        else
+        {
+            // The shutter is reported when the neutral exposure starts, wait for it and the darker and brighter ones (+10%)
+            final double factor = Math.pow(2, m_bracketNativePeriod / 10.0);
+            final double exposuresMs = m_bracketNativeExposureMs + m_bracketNativeExposureMs / factor +
+                    Math.min(m_bracketNativeExposureMs * factor, MAX_EXPOSURE_MS);
+            final long holdMs = NATIVE_BRACKET_HOLD_BASE + (long)(1.1 * exposuresMs);
+            m_handler.removeCallbacks(m_bracketNativeTimeoutRunnable);
+            m_handler.postDelayed(m_bracketNativeReleaseRunnable, holdMs);
+        }
+    }
+
+    private void onNativeBracketExposureDone(int result, CameraEx.ExposureInfo exposureInfo)
+    {
+        final long now = SystemClock.elapsedRealtime();
+        if (BRACKET_TIMING_ENABLED)
+            m_tvLog.append(String.format("#%d %s: +%dms (result %d)\n", m_bracketPicsTaken + 1,
+                    CameraUtil.formatShutterSpeed(exposureInfo.ShutterSpeedNumber, exposureInfo.ShutterSpeedDeanom),
+                    now - m_bracketTimingFire, result));
+        m_bracketTimingFire = now;
+        ++m_bracketPicsTaken;
+        m_handler.removeCallbacks(m_bracketNativeTimeoutRunnable);
+        if (--m_bracketPicCount == 0)
+        {
+            // Release the shutter, give the camera a moment to report the end of the capture
+            m_camera.cancelTakePicture();
+            m_handler.postDelayed(m_bracketNativeTimeoutRunnable, NATIVE_BRACKET_END_TIMEOUT);
+        }
+        else
+            m_handler.postDelayed(m_bracketNativeTimeoutRunnable, getNativeBracketTimeout());
+    }
+
+    private void finishNativeBracket()
+    {
+        if (!m_bracketActive)
+            return;
+        if (BRACKET_TIMING_ENABLED)
+            m_tvLog.append(String.format("Total %dms\n", SystemClock.elapsedRealtime() - m_bracketTimingStart));
+        m_camera.cancelTakePicture();
+        abortBracketing();
     }
 
     private void onShutterTimelapse(int i)
@@ -1345,6 +1516,30 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         m_tvMsg.setText(String.format("%d pictures", m_bracketPicCount));
     }
 
+    private void updateBracketDelay()
+    {
+        m_tvMsg.setVisibility(View.VISIBLE);
+        m_tvMsg.setText(String.format("%d sec delay", m_bracketDelay));
+    }
+
+    private void decrementBracketDelay()
+    {
+        if (m_bracketDelay > BRACKET_MIN_DELAY_SECONDS)
+        {
+            --m_bracketDelay;
+            updateBracketDelay();
+        }
+    }
+
+    private void incrementBracketDelay()
+    {
+        if (m_bracketDelay < BRACKET_MAX_DELAY_SECONDS)
+        {
+            ++m_bracketDelay;
+            updateBracketDelay();
+        }
+    }
+
     private void updateTimelapseInterval()
     {
         m_tvMsg.setVisibility(View.VISIBLE);
@@ -1380,47 +1575,128 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         updateTimelapsePictureCount();
     }
 
+    private boolean checkBracketingAllowed()
+    {
+        if (m_sceneMode != SceneMode.manual && m_sceneMode != SceneMode.aperture)
+        {
+            showMessage("Scene mode must be set to manual or aperture priority");
+            return false;
+        }
+        if (m_curIso == 0)
+        {
+            showMessage("ISO must be set to manual");
+            return false;
+        }
+        return true;
+    }
+
     private void prepareBracketing()
     {
-        if (m_dialMode == DialMode.bracketSetStep || m_dialMode == DialMode.bracketSetPicCount)
+        if (m_dialMode == DialMode.bracketSetStep || m_dialMode == DialMode.bracketSetPicCount || m_dialMode == DialMode.bracketSetDelay)
             abortBracketing();
+        else if (m_bracketArmed)
+            disarmBracketing();
         else
         {
-            if (m_sceneMode != SceneMode.manual)
-            {
-                showMessage("Scene mode must be set to manual");
+            if (!checkBracketingAllowed())
                 return;
-            }
-            if (m_curIso == 0)
-            {
-                showMessage("ISO must be set to manual");
-                return;
-            }
 
             setLeftViewVisibility(false);
 
             setDialMode(DialMode.bracketSetStep);
-            m_bracketPicCount = 3;
-            m_bracketStep = 3;
-            m_bracketShutterDelta = 0;
+            m_bracketPicCount = m_prefs.getBracketPicCount();
+            m_bracketStep = m_prefs.getBracketStep();
+            m_bracketDelay = m_prefs.getBracketDelay();
             updateBracketStep();
-
-            // Remember current shutter speed
-            m_bracketNeutralShutterIndex = CameraUtil.getShutterValueIndex(getCurrentShutterSpeed());
         }
+    }
+
+    private void armBracketing()
+    {
+        m_prefs.setBracketStep(m_bracketStep);
+        m_prefs.setBracketPicCount(m_bracketPicCount);
+        m_prefs.setBracketDelay(m_bracketDelay);
+        m_prefs.setBracketArmed(true);
+        m_bracketArmed = true;
+        // The shutter key no longer takes a picture by itself, onShutterKeyDown starts the bracket instead
+        m_camera.stopDirectShutter(new CameraEx.DirectShutterStoppedCallback()
+        {
+            @Override
+            public void onShutterStopped(CameraEx cameraEx)
+            {
+            }
+        });
+        setDialMode(DialMode.shutter);
+        setLeftViewVisibility(true);
+        showBracketArmedHint();
+    }
+
+    private void disarmBracketing()
+    {
+        m_prefs.setBracketArmed(false);
+        m_bracketArmed = false;
+        m_camera.startDirectShutter();
+        m_handler.removeCallbacks(m_hideBracketHintRunnable);
+        m_tvHint.setVisibility(View.GONE);
+        setDialMode(m_dialMode);
+        if (BRACKET_TIMING_ENABLED)
+            m_tvLog.setVisibility(LOGGING_ENABLED ? View.VISIBLE : View.GONE);
+        showMessage("Bracket off");
+    }
+
+    private void showBracketArmedHint()
+    {
+        final int mod = m_bracketStep % 3;
+        m_tvHint.setText(String.format("Bracket %d x \u00B1%d.%dEV, %ds delay - shutter to shoot", m_bracketPicCount,
+                m_bracketStep / 3, mod == 0 ? 0 : (mod == 1 ? 3 : 7), m_bracketDelay));
+        m_tvHint.setVisibility(View.VISIBLE);
+        m_handler.removeCallbacks(m_hideBracketHintRunnable);
+        m_handler.postDelayed(m_hideBracketHintRunnable, BRACKET_HINT_TIMEOUT);
+    }
+
+    private void restoreBracketArmed()
+    {
+        if (!m_prefs.getBracketArmed())
+            return;
+        m_bracketStep = m_prefs.getBracketStep();
+        m_bracketPicCount = m_prefs.getBracketPicCount();
+        m_bracketDelay = m_prefs.getBracketDelay();
+        m_bracketArmed = true;
+        m_camera.stopDirectShutter(new CameraEx.DirectShutterStoppedCallback()
+        {
+            @Override
+            public void onShutterStopped(CameraEx cameraEx)
+            {
+            }
+        });
+        if (m_dialMode != null)
+            setDialMode(m_dialMode);
+        showBracketArmedHint();
     }
 
     private void abortBracketing()
     {
         m_handler.removeCallbacks(m_countDownRunnable);
+        m_handler.removeCallbacks(m_bracketNativeTimeoutRunnable);
+        m_handler.removeCallbacks(m_bracketNativeReleaseRunnable);
         //m_handler.removeCallbacks(m_timelapseRunnable);
+        final boolean wasShooting = m_bracketActive;
+        final boolean wasNative = m_bracketNative;
         m_bracketActive = false;
-        showMessage("Bracketing finished");
+        m_bracketNative = false;
+        m_bracketNextShutterSpeed = null;
+        if (wasNative)
+            restoreDriveMode();
         setDialMode(DialMode.shutter);
-        m_camera.startDirectShutter();
-        m_camera.getNormalCamera().startPreview();
+        if (!m_bracketArmed)
+            m_camera.startDirectShutter();
+        if (wasShooting && !wasNative)
+            m_camera.getNormalCamera().startPreview();
 
         // Update controls
+        // Saved settings are kept for the next shutter press, the yellow bracket icon shows it's still armed
+        if (m_bracketArmed)
+            m_bracketPicCount = m_prefs.getBracketPicCount();
         m_tvHint.setVisibility(View.GONE);
         setLeftViewVisibility(true);
         updateSceneModeImage();
@@ -1429,10 +1705,21 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         m_viewFlags = m_prefs.getViewFlags(m_viewFlags);
         updateViewVisibility();
 
-        // Reset to previous shutter speed
-        final int shutterDiff = m_bracketNeutralShutterIndex - CameraUtil.getShutterValueIndex(getCurrentShutterSpeed());
-        if (shutterDiff != 0)
-            m_camera.adjustShutterSpeed(-shutterDiff);
+        if (m_bracketFromAperture)
+        {
+            // Back to aperture priority, the camera meters again by itself
+            m_bracketFromAperture = false;
+            setSceneMode(CameraEx.ParametersModifier.SCENE_MODE_APERTURE_PRIORITY);
+            setMinShutterSpeed(m_prefs.getMinShutterSpeed());
+            setDialMode(m_haveApertureControl ? DialMode.aperture : DialMode.iso);
+        }
+        else if (wasShooting)
+        {
+            // Reset to previous shutter speed
+            final int shutterDiff = m_bracketNeutralShutterIndex - CameraUtil.getShutterValueIndex(getCurrentShutterSpeed());
+            if (shutterDiff != 0)
+                m_camera.adjustShutterSpeed(-shutterDiff);
+        }
     }
 
     private void prepareTimelapse()
@@ -1441,6 +1728,8 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             abortTimelapse();
         else
         {
+            if (m_bracketArmed)
+                disarmBracketing();
             setLeftViewVisibility(false);
 
             setDialMode(DialMode.timelapseSetInterval);
@@ -1469,8 +1758,110 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         m_ivBracket.setVisibility(visibility);
     }
 
+    private static boolean listContains(List list, Object value)
+    {
+        if (list == null)
+            return false;
+        for (Object o : list)
+        {
+            if (o.toString().equals(value.toString()))
+                return true;
+        }
+        return false;
+    }
+
+    // Exposure bracket period of the camera's own bracket drive mode (in 1/10 EV) for the configured step, 0 if not available
+    private int getNativeBracketPeriod()
+    {
+        if (m_bracketPicCount != 3)
+            return 0;
+        final int period;
+        switch (m_bracketStep)
+        {
+            case 1: period = 3; break;
+            case 2: period = 7; break;
+            case 3: period = 10; break;
+            case 6: period = 20; break;
+            case 9: period = 30; break;
+            default: return 0;
+        }
+        final CameraEx.ParametersModifier paramsModifier = m_camera.createParametersModifier(m_camera.getNormalCamera().getParameters());
+        if (!listContains(paramsModifier.getSupportedDriveModes(), CameraEx.ParametersModifier.DRIVE_MODE_BRACKET) ||
+            !listContains(paramsModifier.getSupportedBracketModes(), CameraEx.ParametersModifier.BRACKET_MODE_EXPOSURE) ||
+            !listContains(paramsModifier.getSupportedExposureBracketModes(), CameraEx.ParametersModifier.EXPOSURE_BRACKET_MODE_CONTINUE) ||
+            !listContains(paramsModifier.getSupportedExposureBracketPeriods(), period))
+            return 0;
+        return period;
+    }
+
+    private void setNativeBracketDriveMode(int period)
+    {
+        final Camera.Parameters current = m_camera.getNormalCamera().getParameters();
+        final CameraEx.ParametersModifier currentModifier = m_camera.createParametersModifier(current);
+        m_bracketSavedDriveMode = currentModifier.getDriveMode();
+        m_bracketSavedBurstSpeed = currentModifier.getBurstDriveSpeed();
+
+        final Camera.Parameters params = m_camera.createEmptyParameters();
+        final CameraEx.ParametersModifier modifier = m_camera.createParametersModifier(params);
+        modifier.setDriveMode(CameraEx.ParametersModifier.DRIVE_MODE_BRACKET);
+        modifier.setBracketMode(CameraEx.ParametersModifier.BRACKET_MODE_EXPOSURE);
+        modifier.setExposureBracketMode(CameraEx.ParametersModifier.EXPOSURE_BRACKET_MODE_CONTINUE);
+        modifier.setExposureBracketPeriod(period);
+        if (listContains(currentModifier.getSupportedNumsOfBracketPicture(), 3))
+            modifier.setNumOfBracketPicture(3);
+        m_camera.getNormalCamera().setParameters(params);
+    }
+
+    private void restoreDriveMode()
+    {
+        final Camera.Parameters params = m_camera.createEmptyParameters();
+        final CameraEx.ParametersModifier modifier = m_camera.createParametersModifier(params);
+        modifier.setDriveMode(m_bracketSavedDriveMode);
+        modifier.setBurstDriveSpeed(m_bracketSavedBurstSpeed);
+        m_camera.getNormalCamera().setParameters(params);
+    }
+
+    // Allow for the exposures plus some processing time before giving up on the camera
+    private long getNativeBracketTimeout()
+    {
+        final Pair<Integer, Integer> speed = getCurrentShutterSpeed();
+        return 5000 + 4 * 1000L * speed.first / speed.second;
+    }
+
     private void startBracketCountdown()
     {
+        if (!checkBracketingAllowed())
+            return;
+        // Every series starts from the saved settings
+        m_bracketPicCount = m_prefs.getBracketPicCount();
+        m_bracketPicsTaken = 0;
+        final int nativePeriod = getNativeBracketPeriod();
+        m_bracketNative = nativePeriod != 0;
+        if (m_bracketNative)
+        {
+            // The camera meters (also in aperture priority) and shifts the exposure by itself
+            m_bracketNativePeriod = nativePeriod;
+            setNativeBracketDriveMode(nativePeriod);
+        }
+        else
+        {
+            final int neutralIndex = CameraUtil.getShutterValueIndex(getCurrentShutterSpeed());
+            final int maxDelta = (m_bracketPicCount / 2) * m_bracketStep;
+            if (neutralIndex < 0 || neutralIndex - maxDelta < 0 || neutralIndex + maxDelta >= CameraUtil.SHUTTER_SPEEDS.length)
+            {
+                showMessage("Shutter speed out of bracketing range");
+                return;
+            }
+            m_bracketNeutralShutterIndex = neutralIndex;
+        }
+        if (m_sceneMode == SceneMode.aperture && !m_bracketNative)
+        {
+            // Lock the exposure metered in aperture priority mode, then shoot the bracket in manual mode
+            m_bracketFromAperture = true;
+            setMinShutterSpeed(-1);
+            setSceneMode(CameraEx.ParametersModifier.SCENE_MODE_MANUAL_EXPOSURE);
+        }
+        m_bracketNextShutterSpeed = null;
         m_bracketActive = true;
         m_camera.stopDirectShutter(new CameraEx.DirectShutterStoppedCallback()
         {
@@ -1479,8 +1870,9 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             {
             }
         });
-        // Stop preview
-        m_camera.getNormalCamera().stopPreview();
+        // Stop preview, the native bracket keeps it for metering
+        if (!m_bracketNative)
+            m_camera.getNormalCamera().stopPreview();
 
         // Hide some bottom views
         m_prefs.setViewFlags(m_viewFlags);
@@ -1488,8 +1880,10 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         updateViewVisibility();
 
         // Start countdown
-        m_countdown = COUNTDOWN_SECONDS;
-        m_tvMsg.setText(String.format("Starting in %d...", m_countdown));
+        m_countdown = m_bracketDelay;
+        m_handler.removeCallbacks(m_hideMessageRunnable);
+        m_tvMsg.setText(String.format("%d", m_countdown));
+        m_tvMsg.setVisibility(View.VISIBLE);
         m_handler.postDelayed(m_countDownRunnable, 1000);
     }
 
@@ -1522,7 +1916,57 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
     {
         m_tvHint.setVisibility(View.GONE);
         m_tvMsg.setVisibility(View.GONE);
+        if (BRACKET_TIMING_ENABLED)
+        {
+            m_bracketTimingStart = SystemClock.elapsedRealtime();
+            m_bracketTimingShutterDone = m_bracketTimingStart;
+            m_tvLog.setText(m_bracketNative ? "Native bracket\n" : "App bracket\n");
+            m_tvLog.setVisibility(View.VISIBLE);
+        }
+        if (m_bracketNative)
+        {
+            // Keep the shutter "pressed" until the camera reports all pictures, see onShutterBracket
+            m_bracketTimingFire = SystemClock.elapsedRealtime();
+            final Pair<Integer, Integer> speed = getCurrentShutterSpeed();
+            m_bracketNativeExposureMs = 1000L * speed.first / speed.second;
+            m_handler.postDelayed(m_bracketNativeTimeoutRunnable, getNativeBracketTimeout());
+            m_camera.burstableTakePicture();
+            return;
+        }
+        if (m_bracketFromAperture)
+        {
+            // Manual mode keeps its own shutter speed, move it to the one metered in aperture priority
+            final int currentIndex = CameraUtil.getShutterValueIndex(getCurrentShutterSpeed());
+            if (currentIndex < 0)
+            {
+                abortBracketing();
+                showMessage("Unsupported manual shutter speed");
+                return;
+            }
+            final int shutterDiff = currentIndex - m_bracketNeutralShutterIndex;
+            if (shutterDiff != 0)
+            {
+                m_bracketNextShutterSpeed = new Pair<Integer, Integer>(CameraUtil.SHUTTER_SPEEDS[m_bracketNeutralShutterIndex][0],
+                        CameraUtil.SHUTTER_SPEEDS[m_bracketNeutralShutterIndex][1]);
+                m_camera.adjustShutterSpeed(shutterDiff);
+                // First picture is taken in onShutterSpeedChange
+                return;
+            }
+        }
         // Take first picture at set shutter speed
+        bracketTakePicture();
+    }
+
+    private void bracketTakePicture()
+    {
+        final long now = SystemClock.elapsedRealtime();
+        if (BRACKET_TIMING_ENABLED)
+        {
+            final Pair<Integer, Integer> speed = getCurrentShutterSpeed();
+            m_tvLog.append(String.format("#%d %s: speed change %dms", m_bracketPicsTaken + 1,
+                    CameraUtil.formatShutterSpeed(speed.first, speed.second), now - m_bracketTimingShutterDone));
+        }
+        m_bracketTimingFire = now;
         m_camera.burstableTakePicture();
     }
 
@@ -1627,6 +2071,12 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
                     else
                         incrementBracketPicCount();
                     break;
+                case bracketSetDelay:
+                    if (value < 0)
+                        decrementBracketDelay();
+                    else
+                        incrementBracketDelay();
+                    break;
             }
             return true;
         }
@@ -1653,6 +2103,8 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             m_ivTimelapse.setColorFilter(null);
         if (newMode == DialMode.bracket)
             m_ivBracket.setColorFilter(Color.GREEN);
+        else if (m_bracketArmed)
+            m_ivBracket.setColorFilter(Color.YELLOW);
         else
             m_ivBracket.setColorFilter(null);
     }
@@ -1752,12 +2204,21 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             setDialMode(DialMode.bracketSetPicCount);
             m_tvHint.setText("\uE4CD to set picture count, \uE04C to confirm");
             calcMaxBracketPicCount();
+            if (m_bracketPicCount > m_bracketMaxPicCount)
+                m_bracketPicCount = m_bracketMaxPicCount;
             updateBracketPicCount();
             return true;
         }
         else if (m_dialMode == DialMode.bracketSetPicCount)
         {
-            startBracketCountdown();
+            setDialMode(DialMode.bracketSetDelay);
+            m_tvHint.setText("\uE4CD to set delay, \uE04C to confirm");
+            updateBracketDelay();
+            return true;
+        }
+        else if (m_dialMode == DialMode.bracketSetDelay)
+        {
+            armBracketing();
             return true;
         }
         else if (m_dialMode == DialMode.mode)
@@ -1821,38 +2282,37 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
         }
         else
         {
-            switch (m_dialMode)
-            {
-                case shutter:
-                    if (m_haveApertureControl)
-                    {
-                        setDialMode(DialMode.aperture);
-                        break;
-                    }
-                case aperture:
-                    setDialMode(DialMode.iso);
-                    break;
-                case iso:
-                    setDialMode(DialMode.exposure);
-                    break;
-                case exposure:
-                    setDialMode(m_haveTouchscreen ? DialMode.shutter : DialMode.mode);
-                    break;
-                case mode:
-                    setDialMode(DialMode.drive);
-                    break;
-                case drive:
-                    setDialMode(DialMode.timelapse);
-                    break;
-                case timelapse:
-                    setDialMode(DialMode.bracket);
-                    break;
-                case bracket:
-                    setDialMode(DialMode.shutter);
-                    break;
-            }
+            cycleDialMode(1);
             return true;
         }
+    }
+
+    private List<DialMode> getDialModeCycle()
+    {
+        final List<DialMode> modes = new ArrayList<DialMode>();
+        modes.add(DialMode.shutter);
+        if (m_haveApertureControl)
+            modes.add(DialMode.aperture);
+        modes.add(DialMode.iso);
+        modes.add(DialMode.exposure);
+        if (!m_haveTouchscreen)
+        {
+            modes.add(DialMode.mode);
+            modes.add(DialMode.drive);
+            modes.add(DialMode.timelapse);
+            modes.add(DialMode.bracket);
+        }
+        return modes;
+    }
+
+    // Selects the next (direction 1) or previous (direction -1) parameter, does nothing while setting up timelapse / bracketing
+    private void cycleDialMode(int direction)
+    {
+        final List<DialMode> modes = getDialModeCycle();
+        final int index = modes.indexOf(m_dialMode);
+        if (index < 0)
+            return;
+        setDialMode(modes.get((index + direction + modes.size()) % modes.size()));
     }
 
     @Override
@@ -1869,7 +2329,8 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             movePreviewHorizontal((int)(-500.0f / m_curPreviewMagnificationFactor));
             return true;
         }
-        return false;
+        cycleDialMode(-1);
+        return true;
     }
 
     @Override
@@ -1886,7 +2347,8 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
             movePreviewHorizontal((int)(500.0f / m_curPreviewMagnificationFactor));
             return true;
         }
-        return false;
+        cycleDialMode(1);
+        return true;
     }
 
     @Override
@@ -1899,6 +2361,14 @@ public class ManualActivity extends BaseActivity implements SurfaceHolder.Callba
     @Override
     protected boolean onShutterKeyDown()
     {
+        if (m_bracketArmed && !m_bracketActive && !m_timelapseActive && !m_shutterKeyDown &&
+                m_dialMode != DialMode.bracketSetStep && m_dialMode != DialMode.bracketSetPicCount &&
+                m_dialMode != DialMode.bracketSetDelay)
+        {
+            m_shutterKeyDown = true;
+            startBracketCountdown();
+            return true;
+        }
         // direct shutter...
         /*
         log("onShutterKeyDown\n");

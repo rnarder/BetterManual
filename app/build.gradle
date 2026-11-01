@@ -5,11 +5,11 @@ android {
     buildToolsVersion '30.0.2'
 
     defaultConfig {
-        applicationId "com.obsidium.bettermanual"
+        applicationId "com.obsidium.bettermanual.hdr"
         minSdkVersion 10
         targetSdkVersion 10
-        versionCode 7
-        versionName "1.5"
+        versionCode 8
+        versionName "1.5-hdr"
         archivesBaseName = "BetterManual-${versionName}"
     }
     buildTypes {

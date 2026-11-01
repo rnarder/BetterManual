@@ -15,6 +15,10 @@ public class Preferences
     private static final String KEY_BURST_DRIVE_SPEED = "burstDriveSpeed";
     private static final String KEY_MIN_SHUTTER_SPEED = "minShutterSpeed";
     private static final String KEY_VIEW_FLAGS = "viewFlags";
+    private static final String KEY_BRACKET_ARMED = "bracketArmed";
+    private static final String KEY_BRACKET_STEP = "bracketStep";
+    private static final String KEY_BRACKET_PIC_COUNT = "bracketPicCount";
+    private static final String KEY_BRACKET_DELAY = "bracketDelay";
 
     public Preferences(Context context)
     {
@@ -69,5 +73,47 @@ public class Preferences
     public void setViewFlags(int flags)
     {
         m_prefs.edit().putInt(KEY_VIEW_FLAGS, flags).apply();
+    }
+
+    public boolean getBracketArmed()
+    {
+        return m_prefs.getBoolean(KEY_BRACKET_ARMED, false);
+    }
+
+    public void setBracketArmed(boolean armed)
+    {
+        m_prefs.edit().putBoolean(KEY_BRACKET_ARMED, armed).apply();
+    }
+
+    // in 1/3 stops
+    public int getBracketStep()
+    {
+        return m_prefs.getInt(KEY_BRACKET_STEP, 3);
+    }
+
+    public void setBracketStep(int step)
+    {
+        m_prefs.edit().putInt(KEY_BRACKET_STEP, step).apply();
+    }
+
+    public int getBracketPicCount()
+    {
+        return m_prefs.getInt(KEY_BRACKET_PIC_COUNT, 3);
+    }
+
+    public void setBracketPicCount(int count)
+    {
+        m_prefs.edit().putInt(KEY_BRACKET_PIC_COUNT, count).apply();
+    }
+
+    // in seconds
+    public int getBracketDelay()
+    {
+        return m_prefs.getInt(KEY_BRACKET_DELAY, 2);
+    }
+
+    public void setBracketDelay(int seconds)
+    {
+        m_prefs.edit().putInt(KEY_BRACKET_DELAY, seconds).apply();
     }
 }
